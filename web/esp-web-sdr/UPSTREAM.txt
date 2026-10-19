@@ -1,0 +1,6 @@
+Unmodified copy of https://github.com/ESPARGOS/esp-web-sdr (GPL-3.0-or-later)
+commit 6995ed78915a034be54be68abf986d608d7624c4 (2026-10-17)
+
+tools/build_web.py applies small, checked patches when embedding (transport
+swap, insecure-context allowance, labels); these files stay pristine so they
+can be refreshed from upstream.

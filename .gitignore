@@ -1,0 +1,5 @@
+.pio/
+build/
+*.o
+*.bin
+__pycache__/

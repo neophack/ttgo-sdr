@@ -1,0 +1,23 @@
+This firmware is licensed under the GNU GPL v3.0 or later (SPDX:
+GPL-3.0-or-later), because it is a derivative work of ESPARGOS/esp-sdr and
+bundles ESPARGOS/esp-web-sdr:
+
+  https://github.com/ESPARGOS/esp-sdr      (GPL-3.0-or-later)
+  https://github.com/ESPARGOS/esp-web-sdr  (GPL-3.0-or-later)
+
+Ported from esp-sdr (src/sdr_rx.c, src/dsp.c, src/link.cpp):
+  - main/targets/esp32/receiver.c   (dump-engine capture, tuning, gain, filter,
+                                     ESP32 command set)
+  - main/common/rx_lo.h, rx_bandwidth.h (LO planning, analog filter curve)
+  - main/common/burst_commands.h, burst_capture.h, burst_parse.h,
+    burst_serial.c (protocol 6 command handling, packing, lease)
+  - main/common/spectrum.c, spectrum_dc.h, spectrum_math.h, spectrum_stats.c
+    (SPEC/SPC1/SPS1 framing, DC tracker, power-code encoding)
+
+web/esp-web-sdr/ holds unmodified esp-web-sdr files (see UPSTREAM.txt); the
+build applies the patches listed in tools/build_web.py. web/ws-transport.js
+replaces esp-web-sdr's serial-transport.js. The Carlito font inside
+fonts.css is under the SIL Open Font License, as noted in that file.
+
+A copy of the GPL v3 is in web/esp-web-sdr/LICENSE and at
+https://www.gnu.org/licenses/gpl-3.0.html
