@@ -467,9 +467,12 @@ static void compose_row(int y, uint16_t *out) {
         bool level = false;
         for (int i = 0; i <= 4; i++) level |= y == level_rows[i];
         const uint8_t alpha = fill_alpha[y - spec_y0];
+        /* background by colflag, and the same under the trace's fill */
+        const uint16_t base[3] = {level ? C_LEVEL : C_BG, level ? C_LEVEL : C_MINOR, level ? C_LEVEL : C_MAJOR};
+        const uint16_t fill[3] = {tft.alphaBlend(alpha, C_TRACE, base[0]), tft.alphaBlend(alpha, C_TRACE, base[1]),
+                                  tft.alphaBlend(alpha, C_TRACE, base[2])};
         for (int x = 0; x < W; x++) {
-            uint16_t c = level ? C_LEVEL : colflag[x] == 2 ? C_MAJOR : colflag[x] == 1 ? C_MINOR : C_BG;
-            if (y > ty[x]) c = tft.alphaBlend(alpha, C_TRACE, c);
+            uint16_t c = y > ty[x] ? fill[colflag[x]] : base[colflag[x]];
             if (y >= seg_top[x] && y <= seg_bot[x]) c = C_TRACE;
             else if (y == py[x] && py[x] < seg_top[x] - 1) c = C_HOLD;
             out[x] = sw(c);

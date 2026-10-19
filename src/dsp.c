@@ -5,6 +5,9 @@
 #include <math.h>
 #include <string.h>
 
+/* The project builds at -Os; the per-sample loops here are worth -O2. */
+#pragma GCC optimize("O2")
+
 #define DSP_PI 3.14159265358979f
 
 static float fft_buf[2 * DSP_MAX_FFT] __attribute__((aligned(16)));
@@ -15,11 +18,41 @@ float *dsp_scratch(void) { return scratch; }
 
 #ifdef ESP_PLATFORM
 #include "dsps_fft2r.h"
+#include "dsps_fft4r.h"
+/* The scans' 256-point FFTs (4^4) use esp-dsp's radix-4 kernel (a 2048-word
+ * snapshot's Welch spectrum: 1.4 ms -> 0.9 ms); it must match radix-2 on a
+ * test vector at boot or every size stays on radix-2. */
+#define FFT4_N 256u
 static float fft_table[DSP_MAX_FFT] __attribute__((aligned(16)));
-void dsp_init(void) { dsps_fft2r_init_fc32(fft_table, DSP_MAX_FFT); }
+static bool fft4_ok;
 static void fft(float *x, unsigned n) {
-    dsps_fft2r_fc32(x, n);
-    dsps_bit_rev_fc32(x, n);
+    if (n == FFT4_N && fft4_ok) {
+        dsps_fft4r_fc32(x, n);
+        dsps_bit_rev4r_fc32(x, n);
+    } else {
+        dsps_fft2r_fc32(x, n);
+        dsps_bit_rev_fc32(x, n);
+    }
+}
+void dsp_init(void) {
+    dsps_fft2r_init_fc32(fft_table, DSP_MAX_FFT);
+    if (dsps_fft4r_init_fc32(NULL, FFT4_N) != ESP_OK) return;
+    float *a = fft_buf, *b = scratch; /* 2 x 256 complex = both buffers */
+    uint32_t seed = 12345;
+    for (unsigned j = 0; j < 2 * FFT4_N; j++) {
+        seed = seed * 1103515245u + 12345u;
+        a[j] = b[j] = (float)((seed >> 16) & 1023) - 512.0f;
+    }
+    fft4_ok = true;
+    fft(a, FFT4_N);
+    fft4_ok = false;
+    fft(b, FFT4_N);
+    float err = 0, peak = 0;
+    for (unsigned j = 0; j < 2 * FFT4_N; j++) {
+        err = fmaxf(err, fabsf(a[j] - b[j]));
+        peak = fmaxf(peak, fabsf(b[j]));
+    }
+    fft4_ok = err <= 1e-4f * peak;
 }
 #else
 void dsp_init(void) {}
@@ -85,12 +118,31 @@ static void dc_apply(dsp_dc_t *dc, float *x, unsigned n) {
     x[2 * (n - 1) + 1] += di * 0.5f;
 }
 
+/* Removing the capture mean m before the window only changes bins 0 and +-1:
+ * FFT(w * (x - m)) = FFT(w * x) - m * FFT(w), and FFT(w) of the scaled
+ * periodic Hann is exactly {32, -16, -16} there (64/n * {n/2, -n/4, -n/4}).
+ * Summed powers take the correction once at the end:
+ *   sum_s |X_s - a|^2 = sum_s |X_s|^2 - 2 Re(conj(a) sum_s X_s) + S |a|^2
+ * so the mean is accumulated while windowing instead of in a separate pass
+ * over the capture. Max-hold and the DC tracker need every segment
+ * corrected and keep the pass. */
+static void mean_correct(float *pow, unsigned n, unsigned segments, float mr, float mim, const float *xs) {
+    static const float hann_dft[3] = {32.0f, -16.0f, -16.0f};
+    const unsigned bins[3] = {0, 1, n - 1};
+    for (unsigned b = 0; b < 3; b++) {
+        const float ar = mr * hann_dft[b], ai = mim * hann_dft[b];
+        float p = pow[bins[b]] - 2.0f * (ar * xs[2 * b] + ai * xs[2 * b + 1]) + (float)segments * (ar * ar + ai * ai);
+        pow[bins[b]] = p > 0 ? p : 0;
+    }
+}
+
 void dsp_welch(const uint32_t *words, unsigned n, unsigned segments, unsigned flags, float *pow,
                dsp_dc_t *dc) {
     if (n < 4 || n > DSP_MAX_FFT || (n & (n - 1)) || !segments) return;
     window_setup(n);
+    const bool deferred = (flags & DSP_REMOVE_MEAN) && !(flags & DSP_MAX) && !dc;
     float mi = 0, mq = 0;
-    if (flags & DSP_REMOVE_MEAN) {
+    if ((flags & DSP_REMOVE_MEAN) && !deferred) {
         int32_t si = 0, sq = 0; /* 16380 * 511 fits easily */
         const unsigned total = n * segments;
         for (unsigned j = 0; j < total; j++) {
@@ -101,14 +153,28 @@ void dsp_welch(const uint32_t *words, unsigned n, unsigned segments, unsigned fl
         mq = (float)sq / (float)total;
     }
     const float qsign = (flags & DSP_NEGATE_Q) ? -1.0f : 1.0f;
+    int32_t si = 0, sq = 0;
+    float xs[6] = {0}; /* sum over segments of X at bins 0, 1, n-1 */
     for (unsigned s = 0; s < segments; s++) {
         const uint32_t *w = words + s * n;
         for (unsigned j = 0; j < n; j++) {
-            fft_buf[2 * j] = ((float)dsp_i(w[j]) - mi) * window[j];
-            fft_buf[2 * j + 1] = qsign * ((float)dsp_q(w[j]) - mq) * window[j];
+            const uint32_t v = w[j];
+            const int vi = dsp_i(v), vq = dsp_q(v);
+            si += vi;
+            sq += vq;
+            fft_buf[2 * j] = ((float)vi - mi) * window[j];
+            fft_buf[2 * j + 1] = qsign * ((float)vq - mq) * window[j];
         }
         fft(fft_buf, n);
         if (dc) dc_apply(dc, fft_buf, n);
+        if (deferred) {
+            xs[0] += fft_buf[0];
+            xs[1] += fft_buf[1];
+            xs[2] += fft_buf[2];
+            xs[3] += fft_buf[3];
+            xs[4] += fft_buf[2 * (n - 1)];
+            xs[5] += fft_buf[2 * (n - 1) + 1];
+        }
         if (flags & DSP_MAX) {
             for (unsigned j = 0; j < n; j++) {
                 float p = fft_buf[2 * j] * fft_buf[2 * j] + fft_buf[2 * j + 1] * fft_buf[2 * j + 1];
@@ -118,6 +184,10 @@ void dsp_welch(const uint32_t *words, unsigned n, unsigned segments, unsigned fl
             for (unsigned j = 0; j < n; j++)
                 pow[j] += fft_buf[2 * j] * fft_buf[2 * j] + fft_buf[2 * j + 1] * fft_buf[2 * j + 1];
         }
+    }
+    if (deferred) {
+        const float total = (float)(n * segments);
+        mean_correct(pow, n, segments, (float)si / total, qsign * (float)sq / total, xs);
     }
 }
 

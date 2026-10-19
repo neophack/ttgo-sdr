@@ -44,6 +44,10 @@ unsigned sdr_rx_bandwidth_dcap(unsigned mhz);
 
 /* Take the radio: tune if needed, TX off, RX on, gain applied. */
 void sdr_rx_burst_begin(void);
+/* True when tuning to mhz after sdr_rx_radio_restore() switches the LO plan:
+ * sdr_rx_burst_begin() then returns while the PLL still needs ~3 ms, which
+ * the next capture waits out (the previous capture stays readable until then). */
+bool sdr_rx_slow_retune(unsigned mhz);
 /* Capture n words at a dump clock into the reserved bank. *words stays valid
  * (CPU-owned) until the next capture. Returns capture time in us, <0 on error
  * (-4: samples stuck at one value, worth retrying). */

@@ -1,18 +1,21 @@
 /* engine.c — local spectrum scans for the TTGO screen.
  *
  * Band scans (2400..2500 or 2300..2500 MHz, 240 columns): LOs 10 MHz apart
- * at 80 MS/s (1800..2800 MHz: 25 MHz apart, 3 passes, see sweep_xwide). Every frame visits each LO SCAN_PASSES times, one 2048-sample
- * snapshot (25.6 us) per visit, each split into 8 Hann-windowed 256-point
- * FFTs (Welch). Spreading the snapshots across the frame matters more than
- * the FFT count: in a busy band the frame-to-frame variation comes from
- * whether WiFi packets happen to be on air during a snapshot, so 8
- * independent snapshots per LO beat one long one of the same total length.
+ * at 80 MS/s (1800..2800 MHz: 25 MHz apart, see sweep_xwide). Every frame
+ * visits each LO SCAN_PASSES times, one 2048-sample snapshot (25.6 us) per
+ * visit, each split into 8 Hann-windowed 256-point FFTs (Welch). Frames are
+ * kept short (few snapshots each) and the screen averages them with a time
+ * constant (ui_tft.cpp), so a fast frame rate costs no smoothing: what sets
+ * the trace's stability is snapshots per second, and spreading them in time
+ * matters more than the FFT count. In a busy band the variation comes from
+ * whether WiFi packets happen to be on air during a snapshot, so many
+ * independent snapshots beat one long one of the same total length.
  * Each snapshot's mean is removed (LO leakage), Q is negated so +f is above
  * the LO, and every column is the mean power of all bins from all LOs that
  * land in it, skipping +-1 MHz around each LO and down-weighting the analog
  * filter edges.
- * Channel zoom (ch1/6/11): one LO, 40 MS/s, the same 8 x 2048 snapshots;
- * 240 of the 256 bins (37.5 MHz) map 1:1 to the screen columns.
+ * Channel zoom (ch1/6/11): one LO, 40 MS/s, ZOOM_PASSES 2048-sample
+ * snapshots; 240 of the 256 bins (37.5 MHz) map 1:1 to the screen columns.
  *
  * The radio goes back to the access point after every capture, so the FFTs
  * of one LO run while WiFi transmits.
@@ -33,20 +36,22 @@
 
 #define SCAN_FFT    256u
 #define SCAN_SEGS   8u /* FFTs per snapshot: 2048 samples */
-#define SCAN_PASSES 8u /* snapshots per LO per frame (narrow bands) */
+#define SCAN_PASSES 2u /* snapshots per LO per frame (narrow bands) */
+#define ZOOM_PASSES 2u /* snapshots per channel zoom frame */
 /* Sweep LOs 10 MHz apart; each covers its +-1..15 MHz (+-19 down-weighted).
  * 2412..2484 are WiFi channels (fast PHY path); 2312..2402 use the ROM PLL
  * retune, inside esp-sdr's qualified 2210..2651 MHz direct-LO envelope. */
 static const unsigned los_24[] = {2412, 2422, 2432, 2442, 2452, 2462, 2472, 2484};
 static const unsigned los_wide[] = {2312, 2322, 2332, 2342, 2352, 2362, 2372, 2382, 2392,
                                     2402, 2412, 2422, 2432, 2442, 2452, 2462, 2472, 2484};
-/* 1800..2800 MHz: 240 columns of 4.2 MHz, so LOs 25 MHz apart suffice (each
- * column still averages ~13 bins per LO) and 3 snapshots per LO keep the
- * frame near 0.35 s for 40 LOs. Below 2210 MHz the receiver uses esp-sdr's
- * alternate 6/5 LO plan; esp-sdr measured ESP32 reception 1850..2850 MHz,
- * so the first few columns may show no real signal. */
-#define XWIDE_LOS 40
-static unsigned los_xwide[XWIDE_LOS]; /* 1815, 1840, ... 2790 (engine_start) */
+/* 1800..2800 MHz: 240 columns of 4.2 MHz, so LOs 30 MHz apart suffice (each
+ * covers +-15 MHz at full weight; a column still averages ~13 bins per LO)
+ * and one snapshot per LO keeps the frame near 0.1 s for 34 LOs. Below
+ * 2210 MHz the receiver uses esp-sdr's alternate 6/5 LO plan, which costs a
+ * 3 ms settle per LO (sdr_rx_slow_retune); esp-sdr measured ESP32 reception
+ * 1850..2850 MHz, so the first few columns may show no real signal. */
+#define XWIDE_LOS 34
+static unsigned los_xwide[XWIDE_LOS]; /* 1815, 1845, ... 2805 (engine_start) */
 typedef struct {
     float f0, f1;
     const unsigned *los;
@@ -56,7 +61,7 @@ typedef struct {
 static const sweep_t sweep_24 = {2400.0f, 2500.0f, los_24, sizeof(los_24) / sizeof(los_24[0]), SCAN_PASSES};
 static const sweep_t sweep_wide = {2300.0f, 2500.0f, los_wide, sizeof(los_wide) / sizeof(los_wide[0]),
                                    SCAN_PASSES};
-static const sweep_t sweep_xwide = {1800.0f, 2800.0f, los_xwide, XWIDE_LOS, 3};
+static const sweep_t sweep_xwide = {1800.0f, 2800.0f, los_xwide, XWIDE_LOS, 1};
 static const unsigned zoom_los[BAND_COUNT] = {0, 0, 0, 2412, 2437, 2462};
 
 /* ---------------- frame mailbox ---------------- */
@@ -229,33 +234,56 @@ static void sweep_meta(const sweep_t *sw) {
     work.f1_mhz = sw->f1;
 }
 
-static bool scan_sweep(const sweep_t *sw) {
+/* Fold one 80 MS/s snapshot taken at `lo` into the columns. */
+static void sweep_add(const sweep_t *sw, const uint32_t *w, unsigned lo) {
     float *bins = dsp_scratch();
-    const float bin_mhz = 80.0f / SCAN_FFT;
+    const float bin_mhz = 80.0f / SCAN_FFT, cols_per_mhz = UI_COLS / (sw->f1 - sw->f0);
+    const float cols_per_bin = bin_mhz * cols_per_mhz;
+    memset(bins, 0, SCAN_FFT * sizeof(float));
+    dsp_welch(w, SCAN_FFT, SCAN_SEGS, DSP_NEGATE_Q | DSP_REMOVE_MEAN, bins, NULL);
+    /* column = floor(lo_col + off * cols_per_bin): no division or floorf
+     * per bin, they cost more than the bins' arithmetic */
+    const float lo_col = ((float)lo - sw->f0) * cols_per_mhz;
+    for (unsigned k = 0; k < SCAN_FFT; k++) {
+        int off = k < SCAN_FFT / 2 ? (int)k : (int)k - (int)SCAN_FFT;
+        float a = fabsf(off * bin_mhz);
+        if (a < 1.0f || a > 19.0f) continue;
+        float x = lo_col + off * cols_per_bin;
+        if (x < 0 || x >= UI_COLS) continue;
+        unsigned c = (unsigned)x; /* x >= 0: truncation is floor */
+        float weight = a <= 15.0f ? 1.0f : 0.1f; /* analog filter skirt */
+        col_sum[c] += weight * bins[k] * (1.0f / SCAN_SEGS);
+        col_w[c] += weight;
+    }
+}
+
+static bool scan_sweep(const sweep_t *sw) {
     unsigned ok = 0;
+    /* the last snapshot, still in the capture bank until the next capture */
+    const uint32_t *held = NULL;
+    unsigned held_lo = 0;
     memset(col_sum, 0, sizeof(col_sum));
     memset(col_w, 0, sizeof(col_w));
     sdr_rx_set_filter((int)sdr_rx_bandwidth_dcap(67));
     for (unsigned pass = 0; pass < sw->passes; pass++) {
         for (unsigned l = 0; l < sw->count; l++) {
-            const uint32_t *w;
-            if (!capture_at(sw->los[l], SCAN_FFT * SCAN_SEGS, SDR_CLK_80M, &w)) continue;
-            if (!pass && !l) work.gain_seen = (w[0] >> 20) & 0xff;
-            memset(bins, 0, SCAN_FFT * sizeof(float));
-            dsp_welch(w, SCAN_FFT, SCAN_SEGS, DSP_NEGATE_Q | DSP_REMOVE_MEAN, bins, NULL);
-            for (unsigned k = 0; k < SCAN_FFT; k++) {
-                int off = k < SCAN_FFT / 2 ? (int)k : (int)k - (int)SCAN_FFT;
-                float off_mhz = off * bin_mhz, a = fabsf(off_mhz);
-                if (a < 1.0f || a > 19.0f) continue;
-                float weight = a <= 15.0f ? 1.0f : 0.1f; /* analog filter skirt */
-                int c = column_of(sw, (float)sw->los[l] + off_mhz);
-                if (c < 0 || c >= UI_COLS) continue;
-                col_sum[c] += weight * bins[k] / SCAN_SEGS;
-                col_w[c] += weight;
+            const unsigned lo = sw->los[l];
+            if (held && sdr_rx_slow_retune(lo)) {
+                /* this LO's PLL needs ~3 ms anyway: compute the last
+                 * snapshot while it settles instead of after */
+                sdr_rx_set_frequency(lo);
+                sdr_rx_burst_begin();
             }
-            ok++;
+            if (held) sweep_add(sw, held, held_lo);
+            held = NULL;
+            const uint32_t *w;
+            if (!capture_at(lo, SCAN_FFT * SCAN_SEGS, SDR_CLK_80M, &w)) continue;
+            if (!ok++) work.gain_seen = (w[0] >> 20) & 0xff;
+            held = w;
+            held_lo = lo;
         }
     }
+    if (held) sweep_add(sw, held, held_lo);
     if (!ok) return false;
     finish_columns();
     sweep_meta(sw);
@@ -302,11 +330,11 @@ static bool scan_zoom(unsigned lo) {
     sdr_rx_set_filter((int)sdr_rx_bandwidth_dcap(38));
     memset(bins, 0, SCAN_FFT * sizeof(float));
     unsigned passes = 0;
-    for (unsigned pass = 0; pass < SCAN_PASSES; pass++) {
+    for (unsigned pass = 0; pass < ZOOM_PASSES; pass++) {
+        if (pass) vTaskDelay(1); /* spread the snapshots; the AP transmits meanwhile */
         if (!capture_at(lo, SCAN_FFT * SCAN_SEGS, SDR_CLK_40M, &w)) continue;
         if (!passes++) work.gain_seen = (w[0] >> 20) & 0xff;
         dsp_welch(w, SCAN_FFT, SCAN_SEGS, DSP_NEGATE_Q | DSP_REMOVE_MEAN, bins, NULL);
-        vTaskDelay(1); /* spread the snapshots; the AP transmits meanwhile */
     }
     if (!passes) return false;
     /* RF-ordered bins -120..119 -> columns 0..239 (156.25 kHz each) */
@@ -350,7 +378,7 @@ static void idle(unsigned ms) {
     vTaskDelay(1);
     for (unsigned t = 1; t < ms; t += 5) {
         if (link_input_pending()) return;
-        vTaskDelay(pdMS_TO_TICKS(5));
+        vTaskDelay(pdMS_TO_TICKS(ms - t < 5 ? ms - t : 5));
     }
 }
 
@@ -373,19 +401,20 @@ static void engine_task(void *arg) {
         engine_get_local(&cfg);
         int64_t t0 = esp_timer_get_time();
         local_frame(&cfg);
-        /* ~10 frames/s (2.4G), ~5 (2.3-2.5G), ~20 zoomed: plenty for the
-         * screen and it leaves the access point most of the airtime */
-        int64_t period = cfg.band == BAND_SCAN    ? 100000
-                         : cfg.band == BAND_WIDE  ? 200000
-                         : cfg.band == BAND_XWIDE ? 400000
-                                                  : 50000;
+        /* at most ~30 frames/s (2.4G), ~12 (2.3-2.5G), ~10 (1.8-2.8G),
+         * ~60 zoomed: the radio is away from the access point for about
+         * 1 ms per snapshot, so these keep it there most of the time */
+        int64_t period = cfg.band == BAND_SCAN    ? 33000
+                         : cfg.band == BAND_WIDE  ? 80000
+                         : cfg.band == BAND_XWIDE ? 100000
+                                                  : 16000;
         int64_t spent = esp_timer_get_time() - t0;
-        idle(spent < period - 5000 ? (unsigned)((period - spent) / 1000) : 5);
+        idle(spent < period - 2000 ? (unsigned)((period - spent) / 1000) : 2);
     }
 }
 
 void engine_start(void) {
-    for (unsigned i = 0; i < XWIDE_LOS; i++) los_xwide[i] = 1815 + 25 * i;
+    for (unsigned i = 0; i < XWIDE_LOS; i++) los_xwide[i] = 1815 + 30 * i;
     link_init();
     /* Core 0, next to the WiFi driver: PHY calls are never truly concurrent
      * with it, and the Arduino loop (TFT) keeps core 1 to itself. */

@@ -68,11 +68,13 @@ void loop() {
     static ui_frame_t frame;
     uint32_t now = millis();
     uint32_t seq = engine_latest(&frame);
-    if (seq && seq != last_seq) {
+    bool fresh = seq && seq != last_seq;
+    if (fresh) {
         ui_push(frame);
         last_seq = seq;
     }
-    if (now - last_render >= 50) { /* <= 20 fps; also animates toasts */
+    /* every new frame (a render takes ~20 ms); at least 20 fps for toasts */
+    if (fresh || now - last_render >= 50) {
         ui_render();
         last_render = now;
     }
@@ -85,5 +87,5 @@ void loop() {
                  (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT), link_owner());
         last_log = now;
     }
-    delay(2);
+    delay(1);
 }

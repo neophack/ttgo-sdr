@@ -107,6 +107,7 @@ static bool rx_ready;            /* receive-only PBUS state is active */
 static bool lo_alternate;
 static int rx_filter = -1;
 static unsigned filter_saved[2];
+static int64_t settle_until; /* no capture before this (esp_timer us) */
 
 static void filter_apply(void) {
     for (unsigned j = 0; j < 2; j++) {
@@ -161,13 +162,17 @@ static void tune_now(unsigned mhz) {
      * every retune (esp-sdr FREQ: rx_ready = false; prepare_rx();). */
     rx_prepare();
     lo_alternate = plan.alternate;
-    if (rx_lo_select(plan.alternate)) esp_rom_delay_us(3000);
+    /* switching the LO plan needs 3 ms before the first capture (esp-sdr);
+     * sdr_rx_capture waits it out, so the caller can compute meanwhile */
+    if (rx_lo_select(plan.alternate)) settle_until = esp_timer_get_time() + 3000;
     esp_rom_delay_us(150); /* PLL settle before the first capture */
     stats.retunes++;
     stats.last_retune_us = (uint32_t)(esp_timer_get_time() - t0);
 }
 
 void sdr_rx_set_frequency(unsigned mhz) { want_mhz = mhz; }
+/* sdr_rx_radio_restore always returns to the ordinary plan */
+bool sdr_rx_slow_retune(unsigned mhz) { return rx_lo_plan(mhz).alternate; }
 unsigned sdr_rx_frequency(void) { return want_mhz; }
 
 void sdr_rx_burst_begin(void) {
@@ -197,6 +202,7 @@ void sdr_rx_radio_restore(unsigned home_mhz) {
 /* ---- capture (esp-sdr acquire_iq, serial replies removed) ---- */
 int sdr_rx_capture(unsigned n, unsigned clock, const uint32_t **words) {
     if (n < 256 || n > SDR_MAX_SAMPLES || clock > 2 || !rx_ready) return -1;
+    while (esp_timer_get_time() < settle_until) {}
     const unsigned guard = n + 64 < CAPACITY ? n + 64 : CAPACITY;
     REG_WRITE(DUMP_CTRL, 0);
     for (unsigned j = 0; j < guard; j++) samples[j] = SENTINEL;
