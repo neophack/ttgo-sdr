@@ -1,8 +1,11 @@
 /* ui_tft.cpp — power spectrum / waterfall on the TTGO T-Display.
  *
- * The whole 240x135 screen is composed every frame in 15-row strips (one
- * 7 KB sprite) and pushed strip by strip: no full framebuffer, no
- * erase-then-draw, so nothing flickers. Text is drawn into the strip.
+ * The whole 240x135 screen is composed every frame in 5-row strips and
+ * pushed strip by strip: no full framebuffer, no erase-then-draw, so nothing
+ * flickers. Text is drawn into the strip. Two strip sprites alternate: one
+ * is composed while DMA sends the other, and a strip identical to what the
+ * panel already shows (hash) is not sent at all (every strip once a second),
+ * so the 40 MHz SPI link only carries the rows that changed.
  *
  * Display processing (the engine already Welch-averages each frame):
  *   - trace averaging: dB-domain EMA, time constant off / 0.5 / 1.5 / 4 s
@@ -21,10 +24,14 @@
 #include <TFT_eSPI.h>
 #include <math.h>
 #include <stdarg.h>
+#include <stddef.h>
 #include <string.h>
 #include "esp_heap_caps.h"
 #include "link.h"
 #include "sdr_rx.h"
+
+/* The project builds at -Os; composing 32400 pixels a frame is worth -O2. */
+#pragma GCC optimize("O2")
 
 #define W        240
 #define H        135
@@ -37,7 +44,8 @@
 #define CHART_Y0 BAR_H
 #define CHART_Y1 CHAN_Y0 /* exclusive */
 #define WF_ROWS  (CHART_Y1 - CHART_Y0)
-#define STRIP    15
+#define STRIP    5 /* 27 strips, two 2.4 KB buffers */
+#define STRIPS   (H / STRIP)
 #define DEFAULT_GAIN 40
 
 enum { VIEW_SPEC, VIEW_WATER, VIEW_SPLIT, VIEW_COUNT };
@@ -52,7 +60,16 @@ static const char *const avg_names[] = {"AVG OFF", "AVG 0.5s", "AVG 1.5s", "AVG 
 static const uint8_t gain_steps[] = {0 /* AGC */, 20, 30, 40, 50, 60, 70};
 
 static TFT_eSPI tft;
-static TFT_eSprite strip(&tft);
+static TFT_eSprite strips[2] = {TFT_eSprite(&tft), TFT_eSprite(&tft)};
+static TFT_eSprite *strip = &strips[0]; /* the one being composed */
+static uint32_t strip_hash[STRIPS], full_push_ms;
+static bool panel_known; /* strip_hash describes what the panel shows */
+/* Strips wholly inside the status bar (rows < STATIC_TOP) or the channel
+ * strip + axis (rows >= STATIC_BOTTOM) depend only on what static_key()
+ * hashes; while that is unchanged they are neither composed nor sent. */
+#define STATIC_TOP    (BAR_H / STRIP * STRIP)
+#define STATIC_BOTTOM ((CHAN_Y0 + STRIP - 1) / STRIP * STRIP)
+static uint32_t static_keys[2];
 static Preferences prefs;
 
 static constexpr uint16_t rgb(uint8_t r, uint8_t g, uint8_t b) {
@@ -258,13 +275,16 @@ static void draw_tiny(const label_t *l, int strip_y0) {
         const tiny_glyph_t *g = tiny_glyph(*t);
         for (int r = 0; r < 5; r++)
             for (int c = 0; c < g->w; c++)
-                if (g->rows[r] >> (g->w - 1 - c) & 1) strip.drawPixel(x + c, l->y + r - strip_y0, l->color);
+                if (g->rows[r] >> (g->w - 1 - c) & 1) strip->drawPixel(x + c, l->y + r - strip_y0, l->color);
         x += g->w + 1;
     }
 }
 
 static int spec_y0, spec_h, wf_y0, wf_h, div_y;
 static int16_t ty[W], seg_top[W], seg_bot[W], py[W];
+/* per column, one load per pixel: ty | seg_top << 8 | seg_bot << 16 | py << 24
+ * (all rows < 135; py -1 = 255 matches no row) */
+static uint32_t col_pack[W];
 static uint8_t colflag[W]; /* 0 none, 1 minor, 2 major frequency gridline */
 static int16_t level_rows[5];
 static uint8_t chan_mask[W]; /* bit r: a channel range line in row r covers this column */
@@ -406,6 +426,9 @@ static void prepare_spectrum() {
         int a = ty[x], b = x ? ty[x - 1] : ty[x];
         seg_top[x] = a < b ? a : b;
         seg_bot[x] = a < b ? b : a;
+        if (py[x] >= seg_top[x] - 1) py[x] = -1; /* the dot would touch the trace */
+        col_pack[x] = (uint32_t)(ty[x] & 255) | (uint32_t)(seg_top[x] & 255) << 8 | (uint32_t)(seg_bot[x] & 255) << 16 |
+                      (uint32_t)(py[x] & 255) << 24;
     }
     for (int r = 0; r < spec_h; r++) /* gradient 0x45 -> 0x03 alpha */
         fill_alpha[r] = (uint8_t)(0x45 + (0x03 - 0x45) * r / (spec_h > 1 ? spec_h - 1 : 1));
@@ -448,6 +471,29 @@ static void prepare_status() {
         label(W - 2, 2, C_TEXT, TR_DATUM, "%s", ip);
 }
 
+static uint32_t fnv(uint32_t h, const void *data, size_t len) {
+    const uint8_t *p = (const uint8_t *)data;
+    while (len--) h = (h ^ *p++) * 16777619u;
+    return h;
+}
+/* region 0: the status bar, 1: channel strip and axis */
+static uint32_t static_key(int region) {
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < nlabels; i++) {
+        const label_t *l = &labels[i];
+        if (region == 0 ? l->y >= STATIC_TOP : l->y + 8 <= STATIC_BOTTOM) continue;
+        h = fnv(h, l, offsetof(label_t, text));
+        h = fnv(h, l->text, strlen(l->text));
+    }
+    if (region == 1) {
+        h = fnv(h, &band_mode, sizeof(band_mode));
+        h = fnv(h, colflag, sizeof(colflag));
+        h = fnv(h, band_mode ? (const void *)band_line : (const void *)chan_mask,
+                band_mode ? sizeof(band_line) : sizeof(chan_mask));
+    }
+    return h;
+}
+
 static void compose_row(int y, uint16_t *out) {
     if (y < BAR_H) {
         for (int x = 0; x < W; x++) out[x] = sw(C_BAR);
@@ -477,13 +523,23 @@ static void compose_row(int y, uint16_t *out) {
         const uint8_t alpha = fill_alpha[y - spec_y0];
         /* background by colflag, and the same under the trace's fill */
         const uint16_t base[3] = {level ? C_LEVEL : C_BG, level ? C_LEVEL : C_MINOR, level ? C_LEVEL : C_MAJOR};
-        const uint16_t fill[3] = {tft.alphaBlend(alpha, C_TRACE, base[0]), tft.alphaBlend(alpha, C_TRACE, base[1]),
-                                  tft.alphaBlend(alpha, C_TRACE, base[2])};
+        /* byte-swapped once per row, not per pixel */
+        const uint16_t back[3] = {sw(base[0]), sw(base[1]), sw(base[2])};
+        const uint16_t fill[3] = {sw(tft.alphaBlend(alpha, C_TRACE, base[0])), sw(tft.alphaBlend(alpha, C_TRACE, base[1])),
+                                  sw(tft.alphaBlend(alpha, C_TRACE, base[2]))};
+        const uint16_t pal[6] = {back[0], fill[0], back[1], fill[1], back[2], fill[2]};
+        const unsigned trace_c = sw(C_TRACE), hold_c = sw(C_HOLD);
+        /* branch-free (table + conditional moves, one packed load per
+         * column): 37 -> 24 cycles a pixel against if/else
+         * on the LX6, which has no branch prediction */
         for (int x = 0; x < W; x++) {
-            uint16_t c = y > ty[x] ? fill[colflag[x]] : base[colflag[x]];
-            if (y >= seg_top[x] && y <= seg_bot[x]) c = C_TRACE;
-            else if (y == py[x] && py[x] < seg_top[x] - 1) c = C_HOLD;
-            out[x] = sw(c);
+            const uint32_t v = col_pack[x];
+            const int t = v & 255, top = (v >> 8) & 255, bot = (v >> 16) & 255, p = v >> 24;
+            const unsigned below = (unsigned)(t - y) >> 31; /* y > ty[x] */
+            unsigned c = pal[2 * colflag[x] + below];
+            c = (unsigned)(y - top) <= (unsigned)(bot - top) ? trace_c : c;
+            c = y == p ? hold_c : c; /* py < seg_top - 1 or none: never on the trace */
+            out[x] = (uint16_t)c;
         }
     } else if (wf_h && y >= wf_y0 && y < wf_y0 + wf_h) {
         int r = y - wf_y0;
@@ -502,7 +558,17 @@ static void compose_row(int y, uint16_t *out) {
         for (int x = 0; x < W; x++) out[x] = sw(C_BG);
 }
 
+static volatile uint32_t render_us, render_n;
+float ui_take_render(unsigned *count) {
+    const uint32_t us = render_us, n = render_n;
+    render_us = 0;
+    render_n = 0;
+    *count = n;
+    return n ? us / 1000.0f / n : 0;
+}
+
 void ui_render() {
+    const uint32_t t0 = micros();
     nlabels = 0;
     layout();
     if (have_cur) prepare_frequency_axis();
@@ -515,10 +581,25 @@ void ui_render() {
         band_mode = false;
     }
     prepare_status();
-    uint16_t *buf = (uint16_t *)strip.getPointer();
     const bool shot = ui_shot_request;
     if (shot) Serial.printf("TTGO SHOT %d %d\n", W, H);
+    const uint32_t now = millis();
+    const bool full = !panel_known || shot || now - full_push_ms >= 1000;
+    if (full) full_push_ms = now;
+    bool region_same[2];
+    for (int k = 0; k < 2; k++) {
+        const uint32_t key = static_key(k);
+        region_same[k] = !full && key == static_keys[k];
+        static_keys[k] = key;
+    }
+    unsigned next = 0;
+    tft.startWrite();
     for (int s = 0; s < H; s += STRIP) {
+        /* the other buffer may still be on its way to the panel; this one's
+         * transfer finished before that one was queued */
+        if ((s + STRIP <= STATIC_TOP && region_same[0]) || (s >= STATIC_BOTTOM && region_same[1])) continue;
+        strip = &strips[next];
+        uint16_t *buf = (uint16_t *)strip->getPointer();
         for (int r = 0; r < STRIP; r++) compose_row(s + r, buf + r * W);
         for (int i = 0; i < nlabels; i++) {
             const label_t *l = &labels[i];
@@ -527,14 +608,32 @@ void ui_render() {
                 draw_tiny(l, s);
                 continue;
             }
-            strip.setTextColor(l->color);
-            strip.setTextDatum(l->datum);
-            strip.drawString(l->text, l->x, l->y - s, 1);
+            strip->setTextColor(l->color);
+            strip->setTextDatum(l->datum);
+            strip->drawString(l->text, l->x, l->y - s, 1);
         }
-        strip.pushSprite(0, s);
+        const uint32_t *words = (const uint32_t *)buf;
+        /* FNV-1a over 32-bit words in two interleaved chains (half the
+         * multiply latency of one) */
+        uint32_t h0 = 2166136261u, h1 = 0x9e3779b9u;
+        for (int i = 0; i < W * STRIP / 2; i += 2) {
+            h0 = (h0 ^ words[i]) * 16777619u;
+            h1 = (h1 ^ words[i + 1]) * 16777619u;
+        }
+        const uint32_t hash = h0 ^ (h1 * 0x85ebca6bu);
+        if (full || hash != strip_hash[s / STRIP]) {
+            tft.pushImageDMA(0, s, W, STRIP, (const uint16_t *)buf);
+            strip_hash[s / STRIP] = hash;
+            next ^= 1; /* a skipped strip's buffer is free for the next one */
+        }
         if (shot) Serial.write((const uint8_t *)buf, W * STRIP * 2);
     }
+    tft.dmaWait();
+    tft.endWrite();
+    panel_known = true;
     if (shot) ui_shot_request = false;
+    render_us = render_us + (micros() - t0);
+    render_n = render_n + 1;
 }
 
 /* ---------------- buttons ---------------- */
@@ -619,8 +718,11 @@ void ui_init() {
     tft.fillScreen(C_BG);
     ring = (uint32_t *)heap_caps_malloc(WF_ROWS * W, MALLOC_CAP_32BIT | MALLOC_CAP_EXEC);
     if (!ring) ring = (uint32_t *)heap_caps_malloc(WF_ROWS * W, MALLOC_CAP_8BIT);
-    strip.setColorDepth(16);
-    strip.createSprite(W, STRIP);
+    for (TFT_eSprite &sp : strips) {
+        sp.setColorDepth(16);
+        sp.createSprite(W, STRIP);
+    }
+    tft.initDMA();
     palette_init();
 
     prefs.begin("ttgo-sdr", false);

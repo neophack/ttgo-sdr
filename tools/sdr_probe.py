@@ -24,6 +24,10 @@ class Link:
         self.s.port, self.s.baudrate, self.s.timeout = port, baud, 0.05
         self.s.dtr = self.s.rts = False
         self.s.open()
+        # Windows' default 4 KB driver buffer is 20 ms at 2 Mbaud: a busy PC
+        # then drops bytes mid-frame and the CRC checks fail
+        if hasattr(self.s, "set_buffer_size"):
+            self.s.set_buffer_size(rx_size=1 << 20, tx_size=1 << 16)
         self.buf = b""
 
     def read(self, n, timeout=5.0):

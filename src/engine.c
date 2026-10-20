@@ -1,7 +1,7 @@
 /* engine.c — local spectrum scans for the TTGO screen.
  *
  * Band scans (2400..2500 or 2300..2500 MHz, 240 columns): LOs 10 MHz apart
- * at 80 MS/s (1800..2800 MHz: 25 MHz apart, see sweep_xwide). Every frame
+ * at 80 MS/s (1800..2800 MHz: 30 MHz apart, see sweep_xwide). Every frame
  * visits each LO SCAN_PASSES times, one 2048-sample snapshot (25.6 us) per
  * visit, each split into 8 Hann-windowed 256-point FFTs (Welch). Frames are
  * kept short (few snapshots each) and the screen averages them with a time
@@ -17,8 +17,10 @@
  * Channel zoom (ch1/6/11): one LO, 40 MS/s, ZOOM_PASSES 2048-sample
  * snapshots; 240 of the 256 bins (37.5 MHz) map 1:1 to the screen columns.
  *
- * The radio goes back to the access point after every capture, so the FFTs
- * of one LO run while WiFi transmits.
+ * A sweep keeps the radio for a whole pass: each LO is tuned while the DSP
+ * worker on core 1 starts on the previous snapshot's FFTs, the engine joins
+ * in while the PLL settles, then captures. The access point gets the radio
+ * back after each pass and between frames (engine_task sizes that gap).
  *
  * "legacy" reproduces the previous firmware's sweep (one 1024-point FFT per
  * LO, no DC removal, no Q negation, max-merge, 2-sweep average) so its
@@ -33,6 +35,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_timer.h"
+#include "esp_event.h"
+#include "esp_wifi_types.h"
 
 #define SCAN_FFT    256u
 #define SCAN_SEGS   8u /* FFTs per snapshot: 2048 samples */
@@ -98,7 +102,7 @@ static struct {
     uint8_t prev_source;
     uint16_t prev_lo;
     float floor_db;
-    double frame_us;
+    double frame_us, radio_us;
     uint32_t frame_count;
     uint32_t agc_moves, gain_min, gain_max;
 } st = {.gain_min = 255};
@@ -146,12 +150,14 @@ void engine_take_stats(engine_stats_t *out) {
     out->jitter_raw_db = st.frames ? (float)(st.sum_raw / st.frames) : 0;
     out->floor_db = st.floor_db;
     out->frame_ms = st.frame_count ? (float)(st.frame_us / st.frame_count / 1000.0) : 0;
+    out->radio_ms = st.frame_count ? (float)(st.radio_us / st.frame_count / 1000.0) : 0;
     out->agc_moves = st.agc_moves;
     out->gain_min = st.gain_min;
     out->gain_max = st.gain_max;
     st.frames = 0;
     st.sum_raw = 0;
     st.frame_us = 0;
+    st.radio_us = 0;
     st.frame_count = 0;
     st.agc_moves = 0;
     st.gain_min = 255;
@@ -200,9 +206,13 @@ void engine_frame_from_bins(ui_frame_t *f, const float *pow, unsigned n, bool ne
 static float col_sum[UI_COLS], col_w[UI_COLS];
 static ui_frame_t work;
 
-static bool capture_at(unsigned mhz, unsigned n, unsigned clock, const uint32_t **words) {
+static int64_t radio_us; /* this frame's time in capture_at */
+static bool capture_at(unsigned mhz, unsigned n, unsigned clock, const uint32_t **words, bool hold) {
+    const int64_t t0 = esp_timer_get_time();
     sdr_rx_set_frequency(mhz);
-    int us = sdr_rx_capture_burst(n, clock, words, AP_HOME_MHZ);
+    int us = hold ? sdr_rx_capture_held(n, clock, words, AP_HOME_MHZ)
+                  : sdr_rx_capture_burst(n, clock, words, AP_HOME_MHZ);
+    radio_us += esp_timer_get_time() - t0;
     if (us < 0) return false;
     note_gain(*words, n);
     return true;
@@ -234,13 +244,17 @@ static void sweep_meta(const sweep_t *sw) {
     work.f1_mhz = sw->f1;
 }
 
-/* Fold one 80 MS/s snapshot taken at `lo` into the columns. */
-static void sweep_add(const sweep_t *sw, const uint32_t *w, unsigned lo) {
+/* Fold one 80 MS/s snapshot taken at `lo` into the columns: sweep_begin
+ * starts its FFTs on the other core, sweep_add finishes them here. */
+static void sweep_begin(const uint32_t *w) {
+    dsp_welch_begin(w, SCAN_FFT, SCAN_SEGS, DSP_NEGATE_Q | DSP_REMOVE_MEAN, NULL);
+}
+static void sweep_add(const sweep_t *sw, unsigned lo) {
     float *bins = dsp_scratch();
     const float bin_mhz = 80.0f / SCAN_FFT, cols_per_mhz = UI_COLS / (sw->f1 - sw->f0);
     const float cols_per_bin = bin_mhz * cols_per_mhz;
     memset(bins, 0, SCAN_FFT * sizeof(float));
-    dsp_welch(w, SCAN_FFT, SCAN_SEGS, DSP_NEGATE_Q | DSP_REMOVE_MEAN, bins, NULL);
+    dsp_welch_end(bins);
     /* column = floor(lo_col + off * cols_per_bin): no division or floorf
      * per bin, they cost more than the bins' arithmetic */
     const float lo_col = ((float)lo - sw->f0) * cols_per_mhz;
@@ -268,22 +282,34 @@ static bool scan_sweep(const sweep_t *sw) {
     for (unsigned pass = 0; pass < sw->passes; pass++) {
         for (unsigned l = 0; l < sw->count; l++) {
             const unsigned lo = sw->los[l];
-            if (held && sdr_rx_slow_retune(lo)) {
-                /* this LO's PLL needs ~3 ms anyway: compute the last
-                 * snapshot while it settles instead of after */
+            if (held) sweep_begin(held);
+            if (held && (sdr_rx_holding() || sdr_rx_slow_retune(lo))) {
+                /* retune while the other core starts on the last snapshot,
+                 * then finish it while the PLL settles (0.2 ms, 3 ms for
+                 * an LO plan switch) */
+                const int64_t t0 = esp_timer_get_time();
                 sdr_rx_set_frequency(lo);
                 sdr_rx_burst_begin();
+                radio_us += esp_timer_get_time() - t0;
             }
-            if (held) sweep_add(sw, held, held_lo);
+            if (held) sweep_add(sw, held_lo);
             held = NULL;
             const uint32_t *w;
-            if (!capture_at(lo, SCAN_FFT * SCAN_SEGS, SDR_CLK_80M, &w)) continue;
+            /* the radio stays with the sweep for a whole pass and goes back
+             * to the access point after it (engine_task leaves it there
+             * between frames): two PHY channel switches less per snapshot,
+             * and a run of alternate-plan LOs pays the plan switch once */
+            const bool hold = l + 1 < sw->count;
+            if (!capture_at(lo, SCAN_FFT * SCAN_SEGS, SDR_CLK_80M, &w, hold)) continue;
             if (!ok++) work.gain_seen = (w[0] >> 20) & 0xff;
             held = w;
             held_lo = lo;
         }
     }
-    if (held) sweep_add(sw, held, held_lo);
+    if (held) {
+        sweep_begin(held);
+        sweep_add(sw, held_lo);
+    }
     if (!ok) return false;
     finish_columns();
     sweep_meta(sw);
@@ -303,7 +329,7 @@ static bool scan_sweep_legacy(const sweep_t *sw) {
         memset(step, 0, sizeof(step));
         for (unsigned l = 0; l < sw->count; l++) {
             const uint32_t *w;
-            if (!capture_at(sw->los[l], n, SDR_CLK_80M, &w)) continue;
+            if (!capture_at(sw->los[l], n, SDR_CLK_80M, &w, false)) continue;
             memset(bins, 0, n * sizeof(float));
             dsp_welch(w, n, 1, 0, bins, NULL);
             for (unsigned k = 0; k < n; k++) {
@@ -332,7 +358,7 @@ static bool scan_zoom(unsigned lo) {
     unsigned passes = 0;
     for (unsigned pass = 0; pass < ZOOM_PASSES; pass++) {
         if (pass) vTaskDelay(1); /* spread the snapshots; the AP transmits meanwhile */
-        if (!capture_at(lo, SCAN_FFT * SCAN_SEGS, SDR_CLK_40M, &w)) continue;
+        if (!capture_at(lo, SCAN_FFT * SCAN_SEGS, SDR_CLK_40M, &w, false)) continue;
         if (!passes++) work.gain_seen = (w[0] >> 20) & 0xff;
         dsp_welch(w, SCAN_FFT, SCAN_SEGS, DSP_NEGATE_Q | DSP_REMOVE_MEAN, bins, NULL);
     }
@@ -355,6 +381,7 @@ static bool scan_zoom(unsigned lo) {
 static void local_frame(const local_cfg_t *cfg) {
     sdr_rx_set_gain(cfg->agc, cfg->gain);
     int64_t t0 = esp_timer_get_time();
+    radio_us = 0;
     bool ok;
     if (cfg->band == BAND_SCAN || cfg->band == BAND_WIDE || cfg->band == BAND_XWIDE) {
         const sweep_t *sw = cfg->band == BAND_SCAN ? &sweep_24 : cfg->band == BAND_WIDE ? &sweep_wide : &sweep_xwide;
@@ -364,6 +391,7 @@ static void local_frame(const local_cfg_t *cfg) {
     if (!ok) return;
     taskENTER_CRITICAL(&stats_mux);
     st.frame_us += (double)(esp_timer_get_time() - t0);
+    st.radio_us += (double)radio_us;
     st.frame_count++;
     taskEXIT_CRITICAL(&stats_mux);
     work.gain_agc = cfg->agc;
@@ -380,6 +408,16 @@ static void idle(unsigned ms) {
         if (link_input_pending()) return;
         vTaskDelay(pdMS_TO_TICKS(ms - t < 5 ? ms - t : 5));
     }
+}
+
+/* stations associated with the SoftAP (WiFi event loop task) */
+static volatile int ap_stations;
+static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data) {
+    (void)arg;
+    (void)base;
+    (void)data;
+    if (id == WIFI_EVENT_AP_STACONNECTED) ap_stations = ap_stations + 1;
+    else if (id == WIFI_EVENT_AP_STADISCONNECTED && ap_stations > 0) ap_stations = ap_stations - 1;
 }
 
 static TaskHandle_t engine_handle;
@@ -401,22 +439,25 @@ static void engine_task(void *arg) {
         engine_get_local(&cfg);
         int64_t t0 = esp_timer_get_time();
         local_frame(&cfg);
-        /* at most ~30 frames/s (2.4G), ~12 (2.3-2.5G), ~10 (1.8-2.8G),
-         * ~60 zoomed: the radio is away from the access point for about
-         * 1 ms per snapshot, so these keep it there most of the time */
-        int64_t period = cfg.band == BAND_SCAN    ? 33000
-                         : cfg.band == BAND_WIDE  ? 80000
-                         : cfg.band == BAND_XWIDE ? 100000
-                                                  : 16000;
-        int64_t spent = esp_timer_get_time() - t0;
-        idle(spent < period - 2000 ? (unsigned)((period - spent) / 1000) : 2);
+        /* A sweep keeps the radio for whole passes, so the access point
+         * mostly gets it here. With a station associated (it may be loading
+         * the web page) it gets 40% of the time; with none it only needs
+         * beacons and probe replies, 2 ms per frame. Frames come at most
+         * as fast as the screen draws them (~60/s, ~80 zoomed). */
+        const int64_t spent = esp_timer_get_time() - t0;
+        const int64_t floor_us = cfg.band == BAND_SCAN || cfg.band == BAND_WIDE || cfg.band == BAND_XWIDE ? 16000 : 12500;
+        int64_t rest = ap_stations > 0 ? spent * 2 / 3 : 2000;
+        if (spent + rest < floor_us) rest = floor_us - spent;
+        idle((unsigned)((rest + 500) / 1000));
     }
 }
 
 void engine_start(void) {
     for (unsigned i = 0; i < XWIDE_LOS; i++) los_xwide[i] = 1815 + 30 * i;
     link_init();
+    esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_STACONNECTED, on_wifi_event, NULL);
+    esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_STADISCONNECTED, on_wifi_event, NULL);
     /* Core 0, next to the WiFi driver: PHY calls are never truly concurrent
-     * with it, and the Arduino loop (TFT) keeps core 1 to itself. */
+     * with it. Core 1 has the Arduino loop (TFT) and the DSP worker. */
     xTaskCreatePinnedToCore(engine_task, "sdr_engine", 6144, NULL, 3, &engine_handle, 0);
 }

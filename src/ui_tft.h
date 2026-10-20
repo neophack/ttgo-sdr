@@ -16,5 +16,7 @@ extern volatile bool ui_shot_request;
 
 /* Mean per-frame change of the displayed trace (dB) since the last call. */
 float ui_take_jitter(void);
+/* average ui_render() time in ms since the last call (resets); *count = renders */
+float ui_take_render(unsigned *count);
 void ui_set_averaging(unsigned level); /* 0 off, 1 0.5 s, 2 1.5 s, 3 4 s */
 void ui_set_view(unsigned view);        /* 0 spectrum, 1 waterfall, 2 split */

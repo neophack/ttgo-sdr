@@ -42,7 +42,8 @@ unsigned sdr_rx_bandwidth_dcap(unsigned mhz);
 #define SDR_BANDWIDTH_MIN 12u
 #define SDR_BANDWIDTH_MAX 67u
 
-/* Take the radio: tune if needed, TX off, RX on, gain applied. */
+/* Take the radio: tune if needed, TX off, RX on, gain applied (a no-op
+ * while the radio is already held at the requested LO). */
 void sdr_rx_burst_begin(void);
 /* True when tuning to mhz after sdr_rx_radio_restore() switches the LO plan:
  * sdr_rx_burst_begin() then returns while the PLL still needs ~3 ms, which
@@ -54,6 +55,14 @@ bool sdr_rx_slow_retune(unsigned mhz);
 int sdr_rx_capture(unsigned n, unsigned clock, const uint32_t **words);
 /* sdr_rx_burst_begin + capture + radio_restore, retrying a stuck capture. */
 int sdr_rx_capture_burst(unsigned n, unsigned clock, const uint32_t **words, unsigned home_mhz);
+/* burst_begin + capture without handing the radio back, for sweeps that
+ * keep the receiver across several LOs (two PHY channel switches less per
+ * capture, and a run of alternate-plan LOs pays the 3 ms plan switch once);
+ * the sweep's last capture uses sdr_rx_capture_burst. A stuck capture falls
+ * back to capture_burst's retries (home_mhz). */
+int sdr_rx_capture_held(unsigned n, unsigned clock, const uint32_t **words, unsigned home_mhz);
+/* True between sdr_rx_burst_begin() and sdr_rx_radio_restore(). */
+bool sdr_rx_holding(void);
 /* Give the radio back to WiFi: TX on, AGC released, tuned to home_mhz. */
 void sdr_rx_radio_restore(unsigned home_mhz);
 

@@ -30,6 +30,7 @@ typedef struct {
 } dsp_dc_t;
 
 void dsp_init(void);
+bool dsp_fast(void); /* the dual-core 256-point path passed its boot self-test */
 
 /* DSP_MAX_FFT floats of power workspace, shared by the engine task's local
  * scans and protocol commands (they never run concurrently). */
@@ -40,6 +41,12 @@ float *dsp_scratch(void);
  * when DSP_NEGATE_Q is set, -k*fs/n otherwise). dc may be NULL. */
 void dsp_welch(const uint32_t *words, unsigned n, unsigned segments, unsigned flags, float *pow,
                dsp_dc_t *dc);
+
+/* dsp_welch in two halves: begin hands the segments to the other core and
+ * returns, end joins in and adds the result into pow. In between the words
+ * must stay readable and no other dsp_* call may run. */
+void dsp_welch_begin(const uint32_t *words, unsigned n, unsigned segments, unsigned flags, dsp_dc_t *dc);
+void dsp_welch_end(float *pow);
 
 /* esp-sdr wire code: 20*log10(p) rounded, i.e. 0.5 dB steps (0..255). */
 uint8_t dsp_power_code(float p);

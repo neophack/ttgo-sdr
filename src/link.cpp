@@ -118,7 +118,7 @@ void link_ws_closed(int fd) {
 }
 
 static void reply(port_t *p, const char *fmt, ...) {
-    char text[256];
+    char text[384]; /* TTGO STAT is the longest reply */
     va_list ap;
     va_start(ap, fmt);
     int length = vsnprintf(text, sizeof(text), fmt, ap);
@@ -438,11 +438,15 @@ static bool ttgo_command(port_t *p, const char *line) {
         engine_stats_t es;
         engine_take_stats(&es);
         const sdr_stats_t *rs = sdr_rx_stats();
+        unsigned renders;
+        const float render_ms = ui_take_render(&renders);
         reply(p,
               "TTGO STAT {\"frames\":%lu,\"jitter_raw\":%.2f,\"jitter_screen\":%.2f,\"floor\":%.1f,"
-              "\"frame_ms\":%.1f,\"agc_moves\":%lu,\"gain\":[%lu,%lu],\"captures\":%lu,\"errors\":%lu,"
+              "\"frame_ms\":%.1f,\"radio_ms\":%.1f,\"render_ms\":%.1f,\"renders\":%u,\"dsp_fast\":%d,"
+              "\"agc_moves\":%lu,\"gain\":[%lu,%lu],\"captures\":%lu,\"errors\":%lu,"
               "\"count_mismatch\":%lu,\"stuck\":%lu,\"retune_us\":%lu,\"heap\":%lu,\"stack_free\":%u,\"owner\":%d}\n",
               (unsigned long)es.frames, es.jitter_raw_db, ui_take_jitter(), es.floor_db, es.frame_ms,
+              es.radio_ms, render_ms, renders, (int)dsp_fast(),
               (unsigned long)es.agc_moves, (unsigned long)es.gain_min, (unsigned long)es.gain_max,
               (unsigned long)rs->captures, (unsigned long)rs->capture_errors,
               (unsigned long)rs->count_mismatch, (unsigned long)rs->stuck_captures, (unsigned long)rs->last_retune_us,

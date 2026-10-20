@@ -12,8 +12,9 @@
  *   - no retune DC recalibration: upstream patches private PHY-archive data
  *     (chip7_sleep_params, DC tables) whose layout differs in the Arduino
  *     core's PHY build. DC offset is removed in the DSP instead (dsp.c)
- *   - only the first n+64 words carry sentinels: the guard still detects a
- *     short or overrunning capture at a fraction of the cost for small n
+ *   - sentinels only on a 1-in-8 grid, the last 64 words and a 64-word guard
+ *     after n (sentinels_set): still detects a short or overrunning capture,
+ *     at a fraction of the cost
  */
 #include "sdr_rx.h"
 #include <string.h>
@@ -142,7 +143,10 @@ static void rx_prepare(void) {
 static void tune_now(unsigned mhz) {
     int64_t t0 = esp_timer_get_time();
     rx_lo_plan_t plan = rx_lo_plan(mhz);
-    rx_lo_select(false);
+    /* esp-sdr returns to the ordinary plan before every retune; a held
+     * alternate-plan receiver moving to another alternate LO stays on it,
+     * so the 3 ms plan-switch settle is paid once per run of such LOs */
+    bool left_alternate = !(lo_alternate && plan.alternate) && rx_lo_select(false);
     bool channel = (mhz >= 2412 && mhz <= 2472 && (mhz - 2412) % 5 == 0) || mhz == 2484;
     /* Use the PHY entry point even for repeated requests: the Wi-Fi API can
      * skip a channel it thinks is already selected after a direct PLL retune. */
@@ -162,10 +166,14 @@ static void tune_now(unsigned mhz) {
      * every retune (esp-sdr FREQ: rx_ready = false; prepare_rx();). */
     rx_prepare();
     lo_alternate = plan.alternate;
-    /* switching the LO plan needs 3 ms before the first capture (esp-sdr);
-     * sdr_rx_capture waits it out, so the caller can compute meanwhile */
-    if (rx_lo_select(plan.alternate)) settle_until = esp_timer_get_time() + 3000;
-    esp_rom_delay_us(150); /* PLL settle before the first capture */
+    /* switching the LO plan (either way: a held receiver can leave the
+     * alternate plan here) needs 3 ms before the first capture (esp-sdr),
+     * any retune 220 us of PLL settle (150 us left noticeably more
+     * captures stuck); sdr_rx_capture waits them out, so the caller can
+     * compute meanwhile */
+    const int64_t now = esp_timer_get_time();
+    if (rx_lo_select(plan.alternate) || left_alternate) settle_until = now + 3000;
+    if (settle_until < now + 220) settle_until = now + 220;
     stats.retunes++;
     stats.last_retune_us = (uint32_t)(esp_timer_get_time() - t0);
 }
@@ -174,12 +182,10 @@ void sdr_rx_set_frequency(unsigned mhz) { want_mhz = mhz; }
 /* sdr_rx_radio_restore always returns to the ordinary plan */
 bool sdr_rx_slow_retune(unsigned mhz) { return rx_lo_plan(mhz).alternate; }
 unsigned sdr_rx_frequency(void) { return want_mhz; }
+bool sdr_rx_holding(void) { return rx_ready; }
 
 void sdr_rx_burst_begin(void) {
-    if (!rx_ready || now_mhz != want_mhz)
-        tune_now(want_mhz);
-    else
-        rx_prepare();
+    if (!rx_ready || now_mhz != want_mhz) tune_now(want_mhz);
 }
 
 void sdr_rx_radio_restore(unsigned home_mhz) {
@@ -204,13 +210,36 @@ void sdr_rx_radio_restore(unsigned home_mhz) {
 }
 
 /* ---- capture (esp-sdr acquire_iq, serial replies removed) ---- */
+/* Sentinels go on every SENTINEL_GRID-th word below n - SENTINEL_TAIL, on
+ * every word of the last SENTINEL_TAIL below n and on the guard after it. A
+ * short capture stops writing somewhere and leaves the grid or the dense
+ * tail behind it unwritten, an overrun writes into the guard (a written
+ * sample never equals the sentinel, as the full check also assumed).
+ * Marking and checking 1 word in 8 saves ~80 us per 2048-word capture. */
+#define SENTINEL_GRID 8u
+#define SENTINEL_TAIL 64u
+static void sentinels_set(unsigned n, unsigned guard) {
+    const unsigned dense = n > SENTINEL_TAIL ? n - SENTINEL_TAIL : 0;
+    for (unsigned j = 0; j < dense; j += SENTINEL_GRID) samples[j] = SENTINEL;
+    for (unsigned j = dense; j < guard; j++) samples[j] = SENTINEL;
+}
+__attribute__((optimize("O2"))) static bool sentinels_intact(unsigned n, unsigned guard) {
+    const uint32_t *v = samples;
+    const unsigned dense = n > SENTINEL_TAIL ? n - SENTINEL_TAIL : 0;
+    unsigned bad = 0;
+    for (unsigned j = 0; j < dense; j += SENTINEL_GRID) bad |= v[j] == SENTINEL;
+    for (unsigned j = dense; j < n; j++) bad |= v[j] == SENTINEL;
+    for (unsigned j = n; j < guard; j++) bad |= v[j] != SENTINEL;
+    return !bad;
+}
 int sdr_rx_capture(unsigned n, unsigned clock, const uint32_t **words) {
     if (n < 256 || n > SDR_MAX_SAMPLES || clock > 2 || !rx_ready) return -1;
-    while (esp_timer_get_time() < settle_until) {}
+    /* sentinels and the filter first: neither needs the PLL settled */
     const unsigned guard = n + 64 < CAPACITY ? n + 64 : CAPACITY;
     REG_WRITE(DUMP_CTRL, 0);
-    for (unsigned j = 0; j < guard; j++) samples[j] = SENTINEL;
+    sentinels_set(n, guard);
     filter_apply();
+    while (esp_timer_get_time() < settle_until) {}
     uint32_t owner = DPORT_REG_READ(DPORT_IRAM_DRAM_AHB_SEL_REG);
     uint32_t byte_select = REG_READ(DUMP_BYTES);
     DPORT_REG_WRITE(DPORT_IRAM_DRAM_AHB_SEL_REG,
@@ -237,11 +266,10 @@ int sdr_rx_capture(unsigned n, unsigned clock, const uint32_t **words) {
     /* Upstream also requires the sample count here; it is kept as a counter
      * so a silicon/PHY difference shows up in the stats instead of failing. */
     if ((status & 0x7fff) != n) stats.count_mismatch++;
-    for (unsigned j = 0; j < guard; j++)
-        if ((j < n) == (samples[j] == SENTINEL)) {
-            stats.capture_errors++;
-            return -3;
-        }
+    if (!sentinels_intact(n, guard)) {
+        stats.capture_errors++;
+        return -3;
+    }
     /* A few percent of captures come back with every sample railed at one
      * value (seen: I=-488, Q=-511 at all LOs, ~3%): the RX chain was not
      * delivering data. Sixteen spread-out words decide it cheaply. */
@@ -273,6 +301,14 @@ int sdr_rx_capture_burst(unsigned n, unsigned clock, const uint32_t **words, uns
         vTaskDelay(1 + attempt);
     }
     return us;
+}
+
+int sdr_rx_capture_held(unsigned n, unsigned clock, const uint32_t **words, unsigned home_mhz) {
+    sdr_rx_burst_begin();
+    int us = sdr_rx_capture(n, clock, words);
+    if (us != -4) return us;
+    /* a stuck capture gets the usual retries, radio handed back in between */
+    return sdr_rx_capture_burst(n, clock, words, home_mhz);
 }
 
 /* ---- gain / filter ---- */

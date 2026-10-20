@@ -50,6 +50,7 @@ typedef struct {
     float jitter_raw_db;
     float floor_db; /* 20th percentile of the last frame */
     float frame_ms; /* average local frame compute time */
+    float radio_ms; /* of which tuning, capturing and handing the radio back */
     uint32_t agc_moves; /* captures whose gain index changed mid-capture */
     uint32_t gain_min, gain_max;
 } engine_stats_t;
