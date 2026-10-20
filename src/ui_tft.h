@@ -5,7 +5,6 @@
 
 void ui_init();
 void ui_boot_line(const char *text); /* splash progress */
-void ui_set_ip(const char *ip);
 void ui_push(const ui_frame_t &frame); /* feed every new frame (waterfall rows) */
 void ui_render();                      /* compose and push one screen */
 void ui_poll(uint32_t now_ms);         /* buttons */

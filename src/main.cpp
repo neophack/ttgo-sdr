@@ -49,7 +49,6 @@ void setup() {
     WiFi.softAP(AP_SSID, AP_PASS, AP_CHANNEL, 0, 4);
     esp_wifi_set_ps(WIFI_PS_NONE);
     esp_wifi_set_promiscuous(true);
-    ui_set_ip(WiFi.softAPIP().toString().c_str());
     log_line("\n[boot] AP %s at %s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
 
     ui_boot_line("RF capture backend");
@@ -57,7 +56,7 @@ void setup() {
     engine_start();
     log_line("[boot] engine up, gain_max=%u heap=%u\n", sdr_rx_gain_max(), (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT));
 
-    ui_boot_line("Web server");
+    ui_boot_line(("Web  http://" + WiFi.softAPIP().toString()).c_str());
     if (!web_start()) log_line("[boot] WARNING: httpd failed\n");
     else log_line("[boot] http://%s\n", WiFi.softAPIP().toString().c_str());
     delay(600); /* let the splash show */

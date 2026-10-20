@@ -14,6 +14,8 @@
  *     in 5 dB steps with 4 dB hysteresis, top = decaying peak + 5 dB in
  *     10 dB steps, evaluated once a second
  *   - colours and waterfall palette are esp-web-sdr's
+ *   - status bar: mode, gain, averaging, and the peak marker's frequency and
+ *     level (the marker is a white triangle over the trace)
  *
  * Buttons: GPIO0  short = spectrum / waterfall / split, long = averaging
  *          GPIO35 short = band (2.4G / 2.3-2.5G / 1.8-2.8G scan, ch1 / ch6 /
@@ -36,8 +38,8 @@
 #define W        240
 #define H        135
 #define BAR_H    12
-#define AXIS_H   10
-#define CHAN_H   20 /* WiFi channel strip between the chart and the MHz axis */
+#define AXIS_H   8  /* 2 tick rows, 3x5 labels, a gap */
+#define CHAN_H   21 /* WiFi channel strip between the chart and the frequency axis */
 #define CHAN_LINES 5 /* rows of channel range lines, 2 px apart, below the numbers */
 #define AXIS_Y0  (H - AXIS_H)
 #define CHAN_Y0  (AXIS_Y0 - CHAN_H)
@@ -55,6 +57,7 @@ static const char *const view_names[VIEW_COUNT] = {"SPECTRUM", "WATERFALL", "SPL
  * peak dots and the waterfall keep the raw frames. */
 static const float avg_tau[] = {0.0f, 0.5f, 1.5f, 4.0f};
 static const char *const avg_names[] = {"AVG OFF", "AVG 0.5s", "AVG 1.5s", "AVG 4s"};
+static const char *const avg_short[] = {"AVG 0", "AVG.5", "AVG1.5", "AVG 4"}; /* status bar */
 #define AVG_LEVELS 4
 #define AVG_DEFAULT 2
 static const uint8_t gain_steps[] = {0 /* AGC */, 20, 30, 40, 50, 60, 70};
@@ -84,7 +87,8 @@ static const uint16_t C_BG = rgb(0x18, 0x21, 0x26), C_LEVEL = rgb(0x34, 0x40, 0x
                       C_TEXT = rgb(0xa1, 0xad, 0xb2), C_BAR = rgb(0x0e, 0x15, 0x18),
                       C_WF_EMPTY = rgb(0x11, 0x19, 0x1e), C_DIV = rgb(0x29, 0x31, 0x35),
                       C_TICK = rgb(0x5b, 0x68, 0x6e), C_MODE = rgb(0xc0, 0xc9, 0xcd),
-                      C_REMOTE = rgb(0xe0, 0xa0, 0x40), C_TOAST = rgb(0xff, 0xd1, 0x66);
+                      C_REMOTE = rgb(0xe0, 0xa0, 0x40), C_TOAST = rgb(0xff, 0xd1, 0x66),
+                      C_MARK = rgb(0xf0, 0xf4, 0xf6);
 
 static uint16_t wf_pal[256];     /* waterfall palette, native order */
 static uint16_t wf_lut[256];     /* stored code -> swapped colour for the current scale */
@@ -107,7 +111,11 @@ static bool auto_pk_ok;
 static uint32_t auto_t;
 static ui_frame_t cur;
 static bool have_cur;
-static char ip[20] = "-";
+/* peak marker: the trace's highest column. It follows the maximum within
+ * 2 columns and jumps elsewhere only for 3 dB more, so a burst or noise does
+ * not throw it around between nearly equal peaks. */
+static int pk_col = -1;
+static float pk_db;
 static char toast_text[24];
 static uint32_t toast_until;
 static local_cfg_t local;
@@ -182,6 +190,7 @@ void ui_push(const ui_frame_t &f) {
     if (key != trace_key) {
         trace_key = key;
         have_trace = false;
+        pk_col = -1;
         ring_count = 0;
         auto_t = 0;
         auto_pk_ok = false;
@@ -218,6 +227,11 @@ void ui_push(const ui_frame_t &f) {
         if (ring_count < WF_ROWS) ring_count++;
     }
     autoscale(trace);
+    int best = 0;
+    for (int c = 1; c < W; c++)
+        if (trace[c] > trace[best]) best = c;
+    if (pk_col < 0 || abs(best - pk_col) <= 2 || trace[best] > trace[pk_col] + 3) pk_col = best;
+    pk_db = trace[pk_col];
     cur = f;
     have_cur = true;
 }
@@ -244,8 +258,9 @@ static void label(int x, int y, uint16_t color, uint8_t datum, const char *fmt, 
     va_end(ap);
 }
 
-/* 5-pixel-tall labels for the channel / band strip where 6x8 text would
- * collide: digits and the letters of "n41" and "WiFi". Rows are bit maps
+/* 5-pixel-tall labels for the frequency axis and the channel / band strip
+ * where 6x8 text would collide, and the dB scale: digits, '.', '-' and the
+ * letters of "n41" and "WiFi". Rows are bit maps
  * of the glyph width, MSB = leftmost column. */
 #define TINY_DATUM 255
 struct tiny_glyph_t {
@@ -257,7 +272,8 @@ static const tiny_glyph_t tiny_font[] = {
     {'3', 3, {7, 1, 7, 1, 7}}, {'4', 3, {5, 5, 7, 1, 1}}, {'5', 3, {7, 4, 7, 1, 7}},
     {'6', 3, {7, 4, 7, 5, 7}}, {'7', 3, {7, 1, 1, 1, 1}}, {'8', 3, {7, 5, 7, 5, 7}},
     {'9', 3, {7, 5, 7, 1, 7}}, {'n', 3, {0, 6, 5, 5, 5}}, {'i', 1, {1, 0, 1, 1, 1}},
-    {'F', 3, {7, 4, 6, 4, 4}}, {'W', 5, {17, 17, 21, 21, 10}},
+    {'F', 3, {7, 4, 6, 4, 4}}, {'W', 5, {17, 17, 21, 21, 10}}, {'.', 1, {0, 0, 0, 0, 1}},
+    {'-', 2, {0, 0, 3, 0, 0}},
 };
 static const tiny_glyph_t *tiny_glyph(char c) {
     for (const tiny_glyph_t &g : tiny_font)
@@ -281,6 +297,9 @@ static void draw_tiny(const label_t *l, int strip_y0) {
 }
 
 static int spec_y0, spec_h, wf_y0, wf_h, div_y;
+/* down-pointing 5x3 triangles: [0] over the peak on the trace (clipped to
+ * the spectrum), [1] in front of the peak readout; x < 0 = not drawn */
+static int16_t mark_x[2], mark_y[2];
 static int16_t ty[W], seg_top[W], seg_bot[W], py[W];
 /* per column, one load per pixel: ty | seg_top << 8 | seg_bot << 16 | py << 24
  * (all rows < 135; py -1 = 255 matches no row) */
@@ -356,14 +375,20 @@ static void prepare_frequency_axis() {
             break;
         }
     const float minor = step / 2;
+    /* 100 MHz and coarser steps read as GHz (1.8 2.0 .. 2.8), finer ones as MHz */
+    const bool ghz = step >= 100;
     for (float f = ceilf(f0 / minor) * minor; f <= f1 + 1e-3f; f += minor) {
         int x = (int)lrintf((f - f0) / span * W);
+        if (x == W) x = W - 1; /* f1 is the right edge of the last column */
         if (x < 0 || x >= W) continue;
         bool major = fabsf(f / step - roundf(f / step)) < 1e-3f;
         colflag[x] = major ? 2 : 1;
         if (major) {
-            int lx = x < 12 ? 12 : x > W - 13 ? W - 13 : x;
-            label(lx, AXIS_Y0 + 2, C_TEXT, TC_DATUM, "%d", (int)lrintf(f));
+            char text[8];
+            if (ghz) snprintf(text, sizeof(text), "%.1f", lrintf(f) / 1000.0f);
+            else snprintf(text, sizeof(text), "%d", (int)lrintf(f));
+            const int half = tiny_width(text) / 2 + 1;
+            label(x < half ? half : x > W - 1 - half ? W - 1 - half : x, AXIS_Y0 + 2, C_TEXT, TINY_DATUM, "%s", text);
         }
     }
 }
@@ -374,13 +399,14 @@ static void prepare_frequency_axis() {
  * (ch1 = 2401..2423 MHz, the usual 802.11 channel chart). Overlapping
  * channels go to separate rows: {1,6,11} {2,7,12} {3,8,13} {4,9,14} {5,10}
  * never overlap within a row. A number and its line share the row colour.
- * Numbers use the 6x8 font when channels are at least 11.5 px apart,
- * otherwise 3x5 digits staggered on two rows. */
+ * Numbers use the 6x8 font when channels are at least 14 px apart (two
+ * digits plus a gap), otherwise 3x5 digits, staggered on two rows below
+ * 9 px. */
 static int mhz_to_x(float mhz) { return (int)lrintf((mhz - cur.f0_mhz) / (cur.f1_mhz - cur.f0_mhz) * W); }
 static void prepare_channels() {
     memset(chan_mask, 0, sizeof(chan_mask));
     const float span = cur.f1_mhz - cur.f0_mhz, ch_px = 5.0f * W / span;
-    const bool big = ch_px >= 11.5f;
+    const bool big = ch_px >= 14.0f, stagger = ch_px < 9.0f;
     /* 1.8-2.8G: channels ~1 px apart; show the NR bands and WiFi instead */
     band_mode = ch_px < 5.0f;
     memset(band_line, 0, sizeof(band_line));
@@ -409,15 +435,18 @@ static void prepare_channels() {
         if (big)
             label(xc < 6 ? 6 : xc > W - 7 ? W - 7 : xc, CHAN_Y0 + 1, chan_colors[row], TC_DATUM, "%d", n);
         else
-            label(xc < 4 ? 4 : xc > W - 5 ? W - 5 : xc, CHAN_Y0 + (n & 1 ? 0 : 5), chan_colors[row], TINY_DATUM,
-                  "%d", n);
+            label(xc < 4 ? 4 : xc > W - 5 ? W - 5 : xc, CHAN_Y0 + (!stagger ? 4 : n & 1 ? 0 : 5), chan_colors[row],
+                  TINY_DATUM, "%d", n);
     }
 }
 
 static void prepare_spectrum() {
     for (int i = 0; i <= 4; i++) level_rows[i] = spec_y0 + (int16_t)lrintf(i * (spec_h - 1) / 4.0f);
-    for (int i = 0; i < 4; i++)
-        label(2, level_rows[i] + 2, C_TEXT, TL_DATUM, "%d", (int)lrintf(floor_db + range_db - i * range_db / 4));
+    for (int i = 0; i < 4; i++) { /* 3x5, left-aligned at x = 2 */
+        char text[8];
+        snprintf(text, sizeof(text), "%d", (int)lrintf(floor_db + range_db - i * range_db / 4));
+        label(2 + tiny_width(text) / 2, level_rows[i] + 2, C_TEXT, TINY_DATUM, "%s", text);
+    }
     for (int x = 0; x < W; x++) {
         ty[x] = have_trace ? db_to_y(trace[x]) : spec_y0 + spec_h;
         py[x] = have_trace ? db_to_y(peak[x]) : -1;
@@ -429,6 +458,10 @@ static void prepare_spectrum() {
         if (py[x] >= seg_top[x] - 1) py[x] = -1; /* the dot would touch the trace */
         col_pack[x] = (uint32_t)(ty[x] & 255) | (uint32_t)(seg_top[x] & 255) << 8 | (uint32_t)(seg_bot[x] & 255) << 16 |
                       (uint32_t)(py[x] & 255) << 24;
+    }
+    if (have_trace && pk_col >= 0) { /* tip 2 px above the trace's top at the peak */
+        mark_x[0] = pk_col;
+        mark_y[0] = seg_top[pk_col] - 5;
     }
     for (int r = 0; r < spec_h; r++) /* gradient 0x45 -> 0x03 alpha */
         fill_alpha[r] = (uint8_t)(0x45 + (0x03 - 0x45) * r / (spec_h > 1 ? spec_h - 1 : 1));
@@ -457,18 +490,33 @@ static void prepare_status() {
         default: snprintf(mode, sizeof(mode), "USB %u/%uM", cur.lo_mhz, span); break;
         }
     }
+    /* mode, gain, averaging from the left, peak readout from the right; a
+     * toast takes the place of everything but the mode. 6 px per glyph. */
     bool remote = have_cur && (cur.source == SRC_WEB || cur.source == SRC_USB);
     label(2, 2, remote ? C_REMOTE : C_MODE, TL_DATUM, "%s", mode);
-    if (have_cur) {
-        if (cur.gain_agc)
-            label(94, 2, C_TRACE, TL_DATUM, "AGC %u", cur.gain_seen);
-        else
-            label(94, 2, C_TRACE, TL_DATUM, "G%u", cur.gain_code);
-    }
-    if (toast_until && (int32_t)(millis() - toast_until) < 0)
+    int x = 2 + 6 * (int)strlen(mode) + 6;
+    x = x < 90 ? 90 : x; /* gain stays put across the usual modes */
+    if (toast_until && (int32_t)(millis() - toast_until) < 0) {
         label(W - 2, 2, C_TOAST, TR_DATUM, "%s", toast_text);
+        return;
+    }
+    if (!have_cur) return;
+    if (cur.gain_agc)
+        label(x, 2, C_TRACE, TL_DATUM, "AGC %u", cur.gain_seen);
     else
-        label(W - 2, 2, C_TEXT, TR_DATUM, "%s", ip);
+        label(x, 2, C_TRACE, TL_DATUM, "G%u", cur.gain_code);
+    x += 6 * (int)strlen(labels[nlabels - 1].text) + 6;
+    int right = W - 2;
+    if (have_trace && pk_col >= 0) {
+        const float col_mhz = (cur.f1_mhz - cur.f0_mhz) / W, f = cur.f0_mhz + (pk_col + 0.5f) * col_mhz;
+        label(right, 2, C_MARK, TR_DATUM, col_mhz < 0.2f ? "%.1f %d" : "%.0f %d", f, (int)lrintf(pk_db));
+        right -= 6 * (int)strlen(labels[nlabels - 1].text) + 2;
+        mark_x[1] = right - 3;
+        mark_y[1] = 4;
+        right -= 5;
+    }
+    const char *avg = avg_short[avg_level];
+    if (x + 6 * (int)strlen(avg) + 4 <= right) label(x, 2, C_TEXT, TL_DATUM, "%s", avg);
 }
 
 static uint32_t fnv(uint32_t h, const void *data, size_t len) {
@@ -511,8 +559,8 @@ static void compose_row(int y, uint16_t *out) {
         int d = y - AXIS_Y0;
         for (int x = 0; x < W; x++) {
             uint16_t c = C_BAR;
-            if (colflag[x] == 2 && d < 4) c = C_TEXT;
-            if (colflag[x] == 1 && d < 2) c = C_TICK;
+            if (colflag[x] == 2 && d < 2) c = C_TEXT;
+            if (colflag[x] == 1 && d < 1) c = C_TICK;
             out[x] = sw(c);
         }
     } else if (y == div_y) {
@@ -570,6 +618,7 @@ float ui_take_render(unsigned *count) {
 void ui_render() {
     const uint32_t t0 = micros();
     nlabels = 0;
+    mark_x[0] = mark_x[1] = -1;
     layout();
     if (have_cur) prepare_frequency_axis();
     else memset(colflag, 0, sizeof(colflag));
@@ -611,6 +660,14 @@ void ui_render() {
             strip->setTextColor(l->color);
             strip->setTextDatum(l->datum);
             strip->drawString(l->text, l->x, l->y - s, 1);
+        }
+        for (int m = 0; m < 2; m++) {
+            if (mark_x[m] < 0) continue;
+            for (int r = 0; r < 3; r++) {
+                const int y = mark_y[m] + r;
+                if (y < s || y >= s + STRIP || (m == 0 && (y < spec_y0 || y >= spec_y0 + spec_h))) continue;
+                strip->drawFastHLine(mark_x[m] - 2 + r, y - s, 5 - 2 * r, C_MARK);
+            }
         }
         const uint32_t *words = (const uint32_t *)buf;
         /* FNV-1a over 32-bit words in two interleaved chains (half the
@@ -746,10 +803,6 @@ void ui_boot_line(const char *text) {
     tft.setTextColor(C_TEXT, C_BG);
     tft.drawString(text, 16, y, 2);
     y += 16;
-}
-
-void ui_set_ip(const char *addr) {
-    strncpy(ip, addr, sizeof(ip) - 1);
 }
 
 float ui_take_jitter(void) {
