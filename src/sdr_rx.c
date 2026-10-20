@@ -186,8 +186,12 @@ void sdr_rx_radio_restore(unsigned home_mhz) {
     REG_WRITE(DUMP_CTRL, 0);
     REG_CLR_BIT(RX_GAIN, BIT(23)); /* the AP's receiver needs its own AGC */
     if (lo_alternate) {
-        rx_lo_select(false);
+        bool changed = rx_lo_select(false);
         lo_alternate = false;
+        /* tune_now() cannot see this switch (rx_lo_select(false) is a no-op
+         * by the time it runs), so the 3 ms LO-plan relock wait must start
+         * here; sdr_rx_capture() waits it out */
+        if (changed) settle_until = esp_timer_get_time() + 3000;
     }
     rom_pbus_workmode();
     rom_pbus_xpd_tx_on();

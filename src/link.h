@@ -24,6 +24,7 @@ void link_init(void);
  * run inline). Returns true if a command was handled. */
 bool link_service(void);
 bool link_input_pending(void);
+/* Engine task only (mutates lease state); other tasks read link_owner(). */
 bool link_lease_active(void);
 int link_owner(void); /* LINK_* of the lease holder, LINK_NONE if free */
 /* True while a protocol client is using UART0: console logging must stop. */

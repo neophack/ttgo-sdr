@@ -5,7 +5,7 @@
  * erase-then-draw, so nothing flickers. Text is drawn into the strip.
  *
  * Display processing (the engine already Welch-averages each frame):
- *   - trace averaging: EMA in linear power, alpha 0 / 0.5 / 0.8
+ *   - trace averaging: dB-domain EMA, time constant off / 0.5 / 1.5 / 4 s
  *   - decaying peak hold (amber dots)
  *   - "calm" auto scale from esp-web-sdr: floor = 20th percentile - 10 dB
  *     in 5 dB steps with 4 dB hysteresis, top = decaying peak + 5 dB in
@@ -13,7 +13,8 @@
  *   - colours and waterfall palette are esp-web-sdr's
  *
  * Buttons: GPIO0  short = spectrum / waterfall / split, long = averaging
- *          GPIO35 short = band (2.4G scan / ch1 / ch6 / ch11), long = gain
+ *          GPIO35 short = band (2.4G / 2.3-2.5G / 1.8-2.8G scan, ch1 / ch6 /
+ *          ch11), long = gain
  */
 #include "ui_tft.h"
 #include <Preferences.h>
@@ -174,7 +175,10 @@ void ui_push(const ui_frame_t &f) {
     last_push_ms = now;
     const float tau = avg_tau[avg_level], a = tau > 0 ? expf(-dt / tau) : 0.0f;
     const float decay = 10.0f * dt; /* peak dots fall 10 dB/s */
-    uint32_t *row = ring + ring_head * (W / 4);
+    /* ring stays NULL when both allocations in ui_init() failed: the
+     * waterfall stays empty (rendered as the empty colour), the trace,
+     * peaks and averaging keep working */
+    uint32_t *row = ring ? ring + ring_head * (W / 4) : nullptr;
     float moved = 0;
     for (int c = 0; c < W; c++) {
         float v = f.db[c];
@@ -182,16 +186,20 @@ void ui_push(const ui_frame_t &f) {
         moved += fabsf(t - trace[c]);
         trace[c] = t;
         peak[c] = have_trace ? fmaxf(peak[c] - decay, v) : v;
-        if ((c & 3) == 0) row[c / 4] = 0;
-        row[c / 4] |= (uint32_t)wf_code(v) << (8 * (c & 3));
+        if (row) {
+            if ((c & 3) == 0) row[c / 4] = 0;
+            row[c / 4] |= (uint32_t)wf_code(v) << (8 * (c & 3));
+        }
     }
     if (have_trace) { /* what the screen trace does frame to frame (TTGO STAT?) */
         jit_sum = jit_sum + moved / W;
         jit_n = jit_n + 1;
     }
     have_trace = true;
-    ring_head = (ring_head + 1) % WF_ROWS;
-    if (ring_count < WF_ROWS) ring_count++;
+    if (row) {
+        ring_head = (ring_head + 1) % WF_ROWS;
+        if (ring_count < WF_ROWS) ring_count++;
+    }
     autoscale(trace);
     cur = f;
     have_cur = true;
@@ -533,8 +541,13 @@ void ui_render() {
 static void apply_local(const char *what) {
     engine_set_local(&local);
     save_prefs();
-    if (link_lease_active()) toast("%s (after WEB)", what);
-    else toast("%s", what);
+    /* link_owner() is a plain volatile read, safe from this loop task;
+     * link_lease_active() mutates lease state and is engine-task-only */
+    int owner = link_owner();
+    if (owner != LINK_NONE)
+        toast("%s (after %s)", what, owner == LINK_WS ? "WEB" : "USB");
+    else
+        toast("%s", what);
 }
 
 static void on_short(int pin) {

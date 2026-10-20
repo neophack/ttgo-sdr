@@ -26,7 +26,7 @@
 #include "ui_tft.h"
 
 #define LEASE_US       5000000
-#define LINE_MAX       128
+#define CMD_LINE_MAX   128
 #define SPEC_SAMPLES   8192u /* per snapshot: 32x256 .. 4x2048 FFTs */
 #define UI_MIRROR_US   66000 /* screen mirror of client spectra: <=15 fps */
 #define UART_BAUD_BOOT 2000000
@@ -39,9 +39,10 @@ typedef struct port {
     bool (*send)(const void *data, size_t len);
     bool (*connected)(void);
     unsigned spec_interval_us; /* minimum SPEC frame spacing (airtime for WiFi) */
-    char line[LINE_MAX];
+    char line[CMD_LINE_MAX];
     size_t used;
     bool overflow;
+    bool held; /* line[] was completed by stop_requested(), not yet run */
     int64_t last_byte;
 } port_t;
 
@@ -98,7 +99,9 @@ bool link_input_pending(void) {
  * WebSocket client is active; an idle one is replaced. */
 void link_ws_input(int fd, const uint8_t *data, size_t len) {
     int64_t now = esp_timer_get_time();
-    if (fd != ws_fd && (ws_fd < 0 || now - ws_activity_us > LEASE_US)) {
+    /* a client stays quiet while a long command (SPEC) streams to it, but
+     * it still holds the lease then; owner_id is a plain volatile read */
+    if (fd != ws_fd && (ws_fd < 0 || (now - ws_activity_us > LEASE_US && owner_id != LINK_WS))) {
         ws_fd = fd;
         xStreamBufferReset(ws_rx);
     }
@@ -287,18 +290,50 @@ static void spec_stats(port_t *p, int64_t dt_us, uint64_t busy_us, uint32_t ffts
     p->send(b, sizeof(b));
 }
 
+/* Line assembly shared by poll_line() and stop_requested(). Feeds one byte;
+ * true when '\n' ended the line. */
+static bool line_feed(port_t *p, uint8_t ch) {
+    if (ch == '\n') return true;
+    if (ch == '\r') return false;
+    if (p->used < CMD_LINE_MAX - 1)
+        p->line[p->used++] = (char)ch;
+    else
+        p->overflow = true;
+    return false;
+}
+/* After '\n': 1 = command in line[], -1 = too long, 0 = empty line. */
+static int line_done(port_t *p) {
+    size_t used = p->used;
+    bool overflow = p->overflow;
+    p->used = 0;
+    p->overflow = false;
+    if (overflow) return -1;
+    if (!used) return 0;
+    p->line[used] = 0;
+    return 1;
+}
+
+/* Any input stops a SPEC stream (radio.js sends an empty line). The bytes
+ * still go through the port's line assembly, so a command sent with the stop
+ * runs after the stream (poll_line picks it up) and one split across the
+ * stream's end is completed by poll_line instead of being cut in two.
+ * cmd_spec() has parsed its arguments out of line[] before this rewrites it. */
 static bool stop_requested(port_t *p) {
     uint8_t c;
     bool stopped = false;
-    for (unsigned j = 0; j < LINE_MAX && p->read(&c, 1) == 1; j++) {
+    for (unsigned j = 0; j < CMD_LINE_MAX && p->read(&c, 1) == 1; j++) {
         stopped = true;
-        if (c == '\n') break;
+        p->last_byte = esp_timer_get_time();
+        if (line_feed(p, c)) {
+            p->held = p->used || p->overflow;
+            break;
+        }
     }
     return stopped || !p->connected();
 }
 
 static void cmd_spec(port_t *p, const char *args) {
-    unsigned v[7];
+    unsigned v[7] = {0};
     int fields = parse_uints(args, v, 7);
     unsigned ms = v[0], stride = v[1], units = v[2], det = v[3], rate = v[4], n = v[5],
              stats = fields == 7 ? v[6] : 0;
@@ -413,7 +448,13 @@ static bool ttgo_command(port_t *p, const char *line) {
               (unsigned long)rs->count_mismatch, (unsigned long)rs->stuck_captures, (unsigned long)rs->last_retune_us,
               (unsigned long)esp_get_free_heap_size(), engine_stack_free(), owner_id);
     } else if (!strcmp(line, "SHOT?")) {
-        /* the UI task writes the reply; stay off UART0 until it is done */
+        /* the UI task writes the reply to UART0: from the WebSocket it would
+         * land in a USB client's byte stream, not here */
+        if (p->id != LINK_UART) {
+            reply(p, "ERR shot_transport\n");
+            return true;
+        }
+        /* stay off UART0 until the UI task is done */
         ui_shot_request = true;
         for (int t = 0; t < 300 && ui_shot_request; t++) vTaskDelay(pdMS_TO_TICKS(10));
         if (ui_shot_request) {
@@ -564,30 +605,21 @@ static void process(port_t *p, char *line) {
 
 /* Assemble one line from a port (esp-sdr burst_serial_poll_line). */
 static int poll_line(port_t *p) {
+    if (p->held) { /* completed while a SPEC stream ran */
+        p->held = false;
+        return line_done(p);
+    }
     int64_t now = esp_timer_get_time();
     if (now - p->last_byte > 3000000) {
         p->used = 0;
         p->overflow = false;
     }
     uint8_t ch;
-    for (unsigned k = 0; k < LINE_MAX && p->read(&ch, 1) == 1; k++) {
+    for (unsigned k = 0; k < CMD_LINE_MAX && p->read(&ch, 1) == 1; k++) {
         p->last_byte = now;
-        if (ch == '\r') continue;
-        if (ch != '\n') {
-            if (p->used < LINE_MAX - 1)
-                p->line[p->used++] = (char)ch;
-            else
-                p->overflow = true;
-            continue;
-        }
-        size_t used = p->used;
-        bool overflow = p->overflow;
-        p->used = 0;
-        p->overflow = false;
-        if (!used && !overflow) continue;
-        if (overflow) return -1;
-        p->line[used] = 0;
-        return 1;
+        if (!line_feed(p, ch)) continue;
+        int status = line_done(p);
+        if (status) return status;
     }
     return 0;
 }
